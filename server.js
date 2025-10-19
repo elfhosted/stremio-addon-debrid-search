@@ -20,9 +20,33 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { obfuscateSensitive } from './lib/common/torrent-utils.js';
+import { getManifest } from './lib/util/manifest.js';
+import landingTemplate from './lib/util/landingTemplate.js';
 
 const RESOLVED_URL_CACHE = new Map();
 const PENDING_RESOLVES = new Map();
+
+const app = express();
+
+app.get('/', (req, res) => {
+    res.redirect('/configure');
+});
+app.get('/configure', (req, res) => {
+    const manifest = getManifest({}, true);
+    res.send(landingTemplate(manifest, {}));  // Pass an empty config object to avoid undefined error
+});
+
+app.get('/manifest-no-catalogs.json', (req, res) => {
+    const manifest = getManifest({}, true);
+    res.json(manifest);
+});
+
+app.use((req, res, next) => {
+    if (['/', '/configure', '/manifest-no-catalogs.json'].includes(req.path) || req.path.startsWith('/resolve/')) {
+        return next();
+    }
+    serverless(req, res);
+});
 
 // Track active Usenet streams: nzoId -> { lastAccess, streamCount, config, videoFilePath, usenetConfig }
 const ACTIVE_USENET_STREAMS = new Map();
@@ -103,8 +127,7 @@ const STREAM_CLEANUP_INTERVAL = 2 * 60 * 1000;
 // If user was just paused/buffering, they can restart the stream
 const STREAM_INACTIVE_TIMEOUT = 10 * 60 * 1000; // 10 minutes of inactivity
 
-const app = express();
-app.enable('trust proxy');
+
 app.use(cors());
 
 // Swagger stats middleware (unchanged)
@@ -745,7 +768,7 @@ async function findVideoFileViaAPI(fileServerUrl, releaseName, options = {}, fil
             return null;
         }
 
-        console.log(`[USENET] Selected largest file: ${largestFile.name} (${(largestFile.size / 1024 / 1024 / 1024).toFixed(2)} GB)`);
+        console.log(`[USENET] Selected largest file: ${largestFile.name} (${(largestFile.size / 1024 / 1024 / 1024).toFixed(2)} GB`);
 
         // Use full path with folder so rar2fs can find the extracted file
         return {
@@ -2192,7 +2215,7 @@ app.get('/usenet/stream/:nzbUrl/:title/:type/:id', async (req, res) => {
                     while (Date.now() - startWait < maxWait) {
                         await new Promise(resolve => setTimeout(resolve, pollInterval));
 
-                        // Check file size again
+                        // Re-check file size again
                         const newStat = fs.statSync(videoFilePath);
                         console.log(`[USENET] Waiting for file to grow... Current size: ${(newStat.size / 1024 / 1024).toFixed(2)} MB`);
 
@@ -2270,20 +2293,40 @@ app.get('/usenet/stream/:nzbUrl/:title/:type/:id', async (req, res) => {
     }
 });
 
-app.use((req, res, next) => serverless(req, res, next));
-
-const port = process.env.PORT || 6907;
-const host = '0.0.0.0';
-const server = app.listen(port, host, () => {
-    console.log(`Started addon at: http://${host}:${port}`);
-
-    if (mongoCache?.isEnabled()) {
-        mongoCache.initMongo().then(() => {
-            console.log('[CACHE] MongoDB cache initialized');
-        }).catch(err => {
-            console.error('[CACHE] MongoDB init failed:', err?.message || err);
-        });
-    } else {
-        console.log('[CACHE] MongoDB cache disabled');
+app.use((req, res, next) => {
+    if (['/', '/configure', '/manifest-no-catalogs.json'].includes(req.path) || req.path.startsWith('/resolve/')) {
+        return next();
     }
+    serverless(req, res, next);
 });
+
+const HOST = process.env.HOST || '0.0.0.0';
+const PORT = process.env.PORT || 7000;  // Consistent port definition
+
+// Only start server if not being imported by cluster setup
+import { fileURLToPath } from 'url';
+import { dirname } from 'path';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+let server = null;
+
+// Check if we're running directly (not being imported by cluster)
+// For standalone mode, start the server directly
+if (import.meta.url === `file://${__filename}`) {
+    server = app.listen(PORT, HOST, () => {
+        console.log('HTTP server listening on port: ' + server.address().port);
+    });
+}
+
+// Export for cluster usage
+export { app, server, PORT, HOST };
+
+if (mongoCache?.isEnabled()) {
+    mongoCache.initMongo().then(() => {
+        console.log('[CACHE] MongoDB cache initialized');
+    }).catch(err => {
+        console.error('[CACHE] MongoDB init failed:', err?.message || err);
+    });
+}
